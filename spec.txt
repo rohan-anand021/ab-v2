@@ -1,0 +1,929 @@
+# AgentBench: Offline Evaluation Harness for AI Coding Agents
+
+## 0) Recommended Stack
+
+**Language/Runtime**
+- Python 3.11+ for the harness
+- uv for dependency management
+- ruff + black for formatting/linting
+- mypy (optional, helpful once schemas stabilize)
+
+**Core Libraries**
+- CLI: typer + rich
+- Config: pydantic-settings + pydantic
+- HTTP (OpenRouter): httpx
+- JSON: stdlib json (orjson if performance matters)
+- Stats/reporting: numpy (bootstrap), statsmodels (McNemar, optional)
+
+**Docker Integration**
+- Start with docker CLI via subprocess (simpler, debuggable)
+- Add optional docker SDK later if needed
+
+**Git Integration**
+- Use git CLI with subprocess
+- Keep a local mirror cache of repos to avoid recloning
+
+---
+
+## 1) System Architecture
+
+```
+ab CLI
+  → loads Suite → list of Tasks
+  → for each Task:
+      → RepoManager prepares checkout (pinned commit)
+      → Sandbox creates containerized workspace
+      → BaselineValidator runs failing_command (network policy configurable)
+      → AgentRunner loops:
+          → builds observation (failure logs + context)
+          → calls LLM (OpenRouter) or scripted agent
+          → executes tool calls in Sandbox
+          → logs every event + file diff
+      → Scorer runs passing_command, captures exit + summary
+      → writes artifacts + JSONL attempt record
+  → Report reads JSONL and emits summary + paired comparisons
+```
+
+**Key design choice**: Event-sourced logging. Every meaningful action becomes an event in JSONL, and the artifacts folder stores the raw evidence (stdout/stderr, diffs, selected files, etc.).
+
+**Critical**: LLM calls happen on the host, not inside the sandbox container. This avoids leaking API keys, keeps sandbox network locked down, and makes artifacts easier to manage.
+
+---
+
+## 2) Repository Structure
+
+```
+agentbench-py/
+  pyproject.toml
+  README.md
+  LICENSE
+  .gitignore
+  .python-version
+  uv.lock
+  .env.example
+
+  agentbench/                     # Python package
+    __init__.py
+    cli.py                        # `ab` entrypoint (Typer)
+    config.py                     # global config, env var loading
+    constants.py
+
+    schemas/
+      task_spec.py                # Pydantic models for task.yaml
+      run_record.py               # attempt record schema (JSONL)
+      events.py                   # tool/agent events
+
+    tasks/
+      loader.py                   # load task folders → Task objects
+      validator.py                # baseline fail-check logic
+
+    repos/
+      manager.py                  # git caching + checkout logic
+
+    sandbox/
+      docker_sandbox.py           # create/run containers, copy files
+      limits.py                   # timeout, cpu/mem policies
+      filesystem.py               # safe path utilities (no escape)
+
+    tools/
+      contract.py                 # ToolRequest/ToolResult types
+      builtins.py                 # read/list/search/patch/run
+      patching.py                 # apply unified diff safely
+
+    agents/
+      base.py                     # Agent interface
+      scripted.py                 # Week 4 scripted agent
+      llm_v0.py                   # Week 6 baseline LLM agent
+      variants/
+        context_packer.py         # Week 9
+        subagents/                # Week 10
+          router.py
+          searcher.py
+          patcher.py
+          tester.py
+
+    llm/
+      client.py                   # provider-agnostic client
+      openrouter.py               # OpenRouter implementation
+      prompts/
+        system_v1.txt
+        formats.py                # message formatting + tool schema
+      redaction.py                # logging policy (secrets)
+
+    scoring/
+      runner.py                   # run passing_command + parse results
+      taxonomy.py                 # failure codes and mapping rules
+
+    reporting/
+      summary.py                  # Week 7
+      paired.py                   # Week 11
+      render.py                   # markdown/csv output helpers
+
+    util/
+      ids.py                      # run_id generation
+      jsonl.py                    # append/read JSONL robustly
+      time.py
+      hashing.py                  # prompt/config hashes
+
+  docker/
+    py-runner/
+      Dockerfile
+      README.md
+
+  configs/
+    variants/
+      baseline.yaml
+      context_packer.yaml
+      subagents.yaml
+
+  tasks/                          # task definitions (data, not code)
+    custom-dev/
+      task_001_slug/
+        task.yaml
+        notes.md
+      task_002_slug/
+        task.yaml
+    custom-heldout/
+      task_101_slug/
+        task.yaml
+
+  artifacts/                      # generated output
+    .gitkeep
+
+  scripts/
+    doctor.sh                     # environment checks (docker, etc.)
+    smoke.sh                      # quick end-to-end sanity
+
+  tests/                          # harness unit tests
+    test_task_loader.py
+    test_patch_apply.py
+    test_artifacts_schema.py
+```
+
+---
+
+## 3) Task Spec Schema (YAML)
+
+```yaml
+id: "pytest-bugfix-requests-parse"
+suite: "custom-dev"
+
+repo:
+  url: "https://github.com/your-org/your-repo.git"
+  commit: "a1b2c3d4e5f6..."
+
+environment:
+  docker_image: "ghcr.io/agentbench/py-runner:0.1.0"
+  python: "3.11"
+  workdir: "/workspace"
+  network_policy: "setup_only"    # none | setup_only | always
+  cpu_limit: 2
+  mem_limit_mb: 4096
+  timeout_sec: 900                # whole task budget
+  tool_timeout_sec: 120           # per tool call command timeout
+
+setup:
+  commands:
+    - "python -m pip install -U pip"
+    - "pip install -r requirements.txt"
+  capture:                        # commands to run after setup for logging
+    - "python -V"
+    - "pip -V"
+    - "pip freeze"
+
+validation:
+  failing_command: "pytest -q"
+  passing_command: "pytest -q"
+
+agent:
+  entrypoint: "llm_v0"            # or scripted
+  max_steps: 30                   # tool-call budget
+  allow_file_write: true
+  editable_globs:                 # optional: paths to constrain edits
+    - "**/*.py"
+    - "pyproject.toml"
+
+artifacts:
+  keep_workspace: true            # store final repo state snapshot
+  redact:
+    - "OPENROUTER_API_KEY"
+```
+
+**Notes:**
+- Keep setup separate from validation
+- Network policy should default to none during agent steps
+- `network_policy=setup_only`: run setup container with network, run agent/test container with `--network=none`
+
+---
+
+## 4) Artifact & Logging Spec
+
+### Artifact Directory Layout (per suite run)
+
+```
+artifacts/
+  runs/
+    2025-12-15T18-00-00-0500__custom-dev__baseline__anthropic_claude-3-5/
+      run.json                    # metadata about the suite run
+      attempts.jsonl              # 1 line per task attempt summary
+      events.jsonl                # event stream (tools, agent turns, etc.)
+      report_summary.md           # Week 7 output
+
+      tasks/
+        pytest-bugfix-requests-parse/
+          task.yaml               # copied spec used for the run (freeze it)
+          repo/                   # optional snapshot of final state
+          logs/
+            setup_stdout.txt
+            setup_stderr.txt
+            failing_stdout.txt
+            failing_stderr.txt
+            passing_stdout.txt
+            passing_stderr.txt
+          agent/
+            conversation.jsonl    # messages + tool calls (redacted)
+            tool_calls.jsonl      # tool invocations (inputs/outputs)
+          diffs/
+            step_0001.patch
+            step_0002.patch
+          meta/
+            timings.json
+            environment.json      # docker image id, limits, etc.
+```
+
+### JSONL Attempt Record Schema
+
+One summary line per task attempt:
+
+```json
+{
+  "run_id": "01JFD...ULID",
+  "task_id": "pytest-bugfix-requests-parse",
+  "suite": "custom-dev",
+  "variant": "baseline",
+  "model": {
+    "provider": "openrouter",
+    "name": "anthropic/claude-3.5-sonnet",
+    "temperature": 0.2,
+    "top_p": 1.0,
+    "max_tokens": 2048,
+    "prompt_version": "system_v1@sha256:..."
+  },
+  "timestamps": {
+    "started_at": "2025-12-15T18:05:12-0500",
+    "ended_at": "2025-12-15T18:07:31-0500"
+  },
+  "duration_sec": 139.2,
+  "baseline_validation": {
+    "attempted": true,
+    "failed_as_expected": true,
+    "exit_code": 1
+  },
+  "result": {
+    "passed": true,
+    "exit_code": 0,
+    "failure_reason": null
+  },
+  "limits": {
+    "timeout_sec": 900,
+    "tool_timeout_sec": 120
+  },
+  "artifact_paths": {
+    "task_dir": "tasks/pytest-bugfix-requests-parse",
+    "failing_stdout": "logs/failing_stdout.txt",
+    "passing_stdout": "logs/passing_stdout.txt"
+  }
+}
+```
+
+### Events JSONL
+
+Use events to reconstruct the run:
+- `task_started`, `setup_command_started`, `setup_command_finished`
+- `agent_turn_started`, `llm_request`, `llm_response` (redacted)
+- `tool_call_started`, `tool_call_finished`
+- `patch_applied`
+- `tests_started`, `tests_finished`
+- `task_finished`
+
+---
+
+## 5) Tool API Contract
+
+A small, stable tool set:
+
+1. **list_files**(root: str, glob: str | null)
+2. **read_file**(path: str, start_line: int | null, end_line: int | null)
+3. **search**(query: str, glob: str | null, max_results: int)
+4. **apply_patch**(unified_diff: str)
+5. **run**(command: str, timeout_sec: int | null, env: dict | null)
+
+**Tool results should include:**
+- ok: bool
+- stdout, stderr, exit_code (for run)
+- changed_files (for patch)
+- error_type + error_message (structured)
+
+**Constraints:**
+- Enforce path safety (no `../` escapes)
+- Optionally enforce `editable_globs`
+
+---
+
+## 6) Docker Sandboxing
+
+### Container Policy
+
+- Use a prebuilt runner image: `ghcr.io/agentbench/py-runner:<version>`
+- Run as non-root user inside container
+- Mount workspace read-write, but do not mount home dir
+- Disable network during agent/test steps: `--network=none`
+- Add resource limits: `--cpus=2`, `--memory=4g`
+- Add timeouts at two levels: harness-level per command, container-level kill if needed
+
+### Runner Image Contents
+
+- python (3.11)
+- git
+- build essentials (common pip packages compile extensions)
+- ripgrep (fast search)
+- a non-root user
+
+### Reproducibility
+
+Record in artifacts:
+- docker image tag and digest
+- OS info from inside container
+- pip freeze (optional but useful)
+
+### Two-Phase Container Approach
+
+1. **Setup phase** (optional network)
+   - `docker run --network=bridge ...`
+   - Runs `setup.commands`
+   - Logs `pip freeze` after setup
+
+2. **Agent + test phase** (no network)
+   - `docker run --network=none ...`
+   - Runs tool commands and test commands
+
+Both containers mount the same host workspace directory.
+
+### Caching
+
+**Git:**
+- Keep a bare mirror cache: `~/.cache/agentbench/git/<hash>.git`
+
+**Pip:**
+- Mount a persistent pip cache volume:
+  - host: `~/.cache/agentbench/pip`
+  - container: `/home/runner/.cache/pip`
+
+---
+
+## 7) OpenRouter Integration
+
+### Configuration Sources (priority order)
+
+1. CLI flags (`--model ... --temperature ...`)
+2. Run config YAML (variant config)
+3. Model preset registry (optional defaults)
+4. Code defaults (last resort)
+
+### What to Log
+
+**Log:**
+- model name string
+- inference params
+- prompt version hash
+- token usage if available
+- tool call decisions and outputs
+
+**Redact:**
+- API keys
+- any detected secrets from repo files
+
+---
+
+## 8) CLI Design
+
+```bash
+# Run a suite with a variant + model
+ab run \
+  --suite custom-dev \
+  --variant baseline \
+  --model anthropic/claude-3.5-sonnet \
+  --max-steps 30 \
+  --workers 4 \
+  --out artifacts/runs
+
+# Run single task (fast iteration)
+ab run-task --task tasks/custom-dev/.../task.yaml
+
+# Validate tasks (baseline should fail)
+ab validate-tasks --suite custom-dev --workers 4
+
+# Generate summary report
+ab report summary --run artifacts/runs/<run-dir>
+
+# Paired comparison
+ab report paired \
+  --run-a artifacts/runs/<baseline-run> \
+  --run-b artifacts/runs/<variant-run> \
+  --method mcnemar
+
+# Environment check
+ab doctor
+```
+
+---
+
+## 9) Failure Taxonomy
+
+Define a small set of codes and map them deterministically:
+
+| Code | Description |
+|------|-------------|
+| `SETUP_FAILED` | Dependency install failure, missing tools |
+| `BASELINE_NOT_FAILING` | Invalid task (baseline passes) |
+| `TIMEOUT` | Command exceeded budget |
+| `SANDBOX_ERROR` | Docker issues, mount failure |
+| `TOOL_ERROR` | Patch failed to apply, invalid path |
+| `TESTS_FAILED` | pytest exit non-zero after agent |
+| `AGENT_GAVE_UP` | Hit max steps without improvement |
+| `LLM_ERROR` | Rate limit, API failure |
+
+**Rule:** Every non-pass must have exactly one primary reason code.
+
+---
+
+## 10) Determinism Protocol
+
+**Harness determinism:**
+- same task spec + same commit + same docker image → same baseline validation result (modulo flaky tests)
+
+**Model nondeterminism:**
+- allow temperature control
+- optionally run multiple seeds per task later
+- keep paired comparisons consistent: same tasks, budgets, timeouts, harness version
+
+**Version everything:**
+- harness version (git SHA)
+- prompt version hash
+- model preset registry version
+
+---
+
+## 11) Weekly Plan
+
+### Week 1: Skeleton + Docker Runner
+- `scripts/doctor.sh` to verify docker, buildkit, disk space
+- `ab run-task --task ... --out ...` command
+- `Sandbox.run()` that launches container, runs command, writes stdout/stderr
+- **Success:** artifacts include docker image digest + executed command list
+
+### Week 2: Loader + Suite + Baseline Validation
+- `tasks/loader.py`: enumerates `tasks/<suite>/*/task.yaml`
+- `tasks/validator.py`: runs `failing_command` after setup
+- Refuse tasks where baseline passes (mark invalid in JSONL)
+
+### Week 3: Schema v0 + Taxonomy
+- `schemas/run_record.py` + JSONL writer
+- `scoring/taxonomy.py`: map exceptions/exit codes/timeouts → reason codes
+- "Always write record even on crash" (try/finally)
+
+### Week 4: Tool API + Scripted Agent
+- `tools/builtins.py` + safe filesystem layer
+- `agents/scripted.py`: hard-coded solve for toy task
+- `events.jsonl` logs each tool invocation with timing
+
+### Week 5: OpenRouter Client + Config Capture
+- `llm/openrouter.py` using httpx
+- `llm/prompts/system_v1.txt` + hashing
+- `config.py`: load OpenRouter key from env; record params in artifacts
+
+### Week 6: Baseline LLM Agent v0 + 10 Tasks
+- `agents/llm_v0.py`:
+  - Loop: run failing tests → summarize → pick files → patch → rerun
+  - Stop conditions: pass, max steps, repeated failure, tool errors
+- Ensure tool-call budget is enforced and logged
+
+### Week 7: Reporting v0
+- `reporting/summary.py` reading `attempts.jsonl`
+- Output markdown table + failure histogram + "hardest tasks"
+- Include artifact links/paths
+
+### Week 8: Expand Benchmark + Heldout + Stability Checks
+- `ab validate-tasks` that:
+  - Runs baseline fail-check twice (detect flakiness)
+  - Records "flaky" label if inconsistent
+- Document task inclusion rules in `tasks/README.md`
+
+### Week 9: Variant Framework + Context Packer
+- `agents/base.py` with variant config structure
+- `variants/context_packer.py`:
+  - Parse pytest output for filenames
+  - Read those files + referenced modules
+  - Cap context by token budget heuristic
+- Emit side-by-side comparison CSV (no stats yet)
+
+### Week 10: Subagents
+- `variants/subagents/router.py`: decides next action
+- Specialists return structured outputs:
+  - Searcher: list of candidate files + snippets
+  - Patcher: proposed unified diff
+  - Tester: recommendation based on test output
+- Log delegation graph in events
+
+### Week 11: Paired Comparisons + Regression Gating
+- `reporting/paired.py`:
+  - Paired contingency table
+  - McNemar p-value or bootstrap CI for delta pass rate
+- "Regression gate" config: max allowed heldout drop, or require non-inferiority
+
+### Week 12: Polish + Docs + Write-up
+- README.md sections: installation, running suites, adding tasks, reading artifacts
+- Freeze a "v1" runner docker image tag (immutable)
+
+---
+
+## 12) Gotchas to Plan For
+
+- **Test flakiness** will dominate your time. Baseline validation should include a flake check early.
+
+- **Dependency installs** are a major cost. Pip cache mounting is non-negotiable for iteration speed.
+
+- **Patch application** must be robust:
+  - Reject patches that touch files outside workspace
+  - Verify hunks apply; otherwise return a structured error
+
+- **Log size control:**
+  - Truncate very large stdout/stderr with "saved first N / last N lines" policy
+  - Store full logs optionally
+
+---
+
+## 13) Spec Improvements (from spec_changes.txt)
+
+Below is a review of the spec plus concrete improvements I’d make. Overall it’s a solid “v0→v1” plan: clear task schema, event-sourced logging, and a pragmatic Docker-first sandbox.
+
+High‑impact improvements (correctness, reproducibility, safety)
+
+1) [DONE] Make the task spec explicitly versioned + strict
+
+- Add task_spec_version: 1 at top-level and enforce it in Pydantic.
+
+- Forbid unknown keys (extra="forbid") so typos don’t silently change behavior.
+
+- Add a harness_min_version (or requires_harness: ">=0.3.0") to prevent old harnesses from mis-running new specs.
+
+2) Clarify workspace lifecycle and “setup modifies repo” semantics
+
+
+Right now “setup” and “baseline validation” are defined, but it’s ambiguous whether setup is allowed to change files and whether that affects baseline expectations.
+
+
+- Decide one of these and encode it:
+	- Option A (recommended): Setup may install deps only; workspace should be clean (no tracked file changes) after setup. If dirty, mark SETUP_DIRTY_WORKTREE / invalid task.
+
+	- Option B: Setup may patch/build artifacts; then baseline/passing commands must run on the post-setup workspace. In that case, snapshot the workspace state after setup and treat that as the “initial state” for the agent.
+
+
+- [DONE] Record git diff --stat after setup in artifacts, always.
+
+3) Strengthen determinism: standardize env + isolate caches
+
+
+Add a small deterministic runtime envelope for every run invocation:
+
+
+- [DONE] Set env defaults in sandbox: PYTHONHASHSEED=0, TZ=UTC, LC_ALL=C, LANG=C, PIP_DISABLE_PIP_VERSION_CHECK=1.
+
+- [DONE] Capture uname -a, python -VV, pip --version, and pytest --version.
+
+- Ensure pip cache is mounted, but also consider per-run “venv/uv cache keys” to reduce cross-task contamination.
+
+4) Improve baseline validation to detect “accidentally passing” and flakiness earlier
+
+
+You already plan “run twice” in Week 8; I’d pull a minimal version earlier:
+
+
+- [DONE] Baseline should run at least twice if time budget allows, or run once plus a quick “rerun failing tests only” heuristic.
+
+- [DONE] Store and compare a normalized failure signature (e.g., failing test nodeids) so you can say “baseline fails consistently in the same way.”
+
+- [DONE] Add BASELINE_FLAKY as a taxonomy outcome (separate from BASELINE_NOT_FAILING).
+
+5) [DONE] Harden Docker sandboxing beyond --network=none
+
+
+For an evaluation harness, Docker hardening matters.
+
+Recommended additions:
+
+
+- [DONE] --cap-drop=ALL, --security-opt no-new-privileges, --pids-limit, --read-only root FS (with writable mounts for workspace and tmp).
+
+- [DONE] Mount a tmpfs for /tmp.
+
+- [DONE] Avoid mounting anything sensitive from host (no home dir, no Docker socket).
+
+- [DONE] Consider --ipc=none and --privileged=false explicitly.
+
+- [DONE] Record the image digest (docker inspect --format '{{.RepoDigests}}') and container run args in artifacts.
+
+6) Add a “resume” / “replay” capability as a first-class feature
+
+
+Event sourcing is perfect for this, but you’ll want it early:
+
+
+- ab run --resume <run-dir>: skips completed tasks, continues from partial runs.
+
+- ab replay --run <run-dir> --task <id>: re-executes tool calls deterministically (no LLM) to debug harness bugs.
+
+Tooling / agent loop improvements (quality of agent evaluation)
+
+7) Expand the tool contract slightly (but keep it stable)
+
+
+Your tool set is minimal and good. Two additions often reduce agent thrash:
+
+
+- write_file(path, content) (sometimes easier/safer than patch for generated files)
+
+- remove_file(path) (rare, but avoids awkward “empty diff” hacks)
+
+If you want to keep only apply_patch, at least support “create new file” and “delete file” unified diff forms reliably, and return structured errors (hunk failed + nearest context).
+
+8) Enforce and log an explicit “editable surface”
+
+
+You already have editable_globs. Make it enforceable at tool level:
+
+
+- On apply_patch, reject modifications outside allowed globs with a structured error (error_type="EDIT_NOT_ALLOWED").
+
+- Log “attempted edit outside policy” as an event; it’s useful for comparing agent variants.
+
+9) Add a first-class “context budget” mechanism
+
+
+You mention token heuristics later. Make it part of the agent interface:
+
+
+- Agent receives context_budget_tokens and returns a structured plan for what it included/excluded.
+
+- Log context_manifest.json per step: files, line ranges, reason for inclusion, and estimated token count. This is huge for debugging and for variant comparisons.
+
+10) Add stop conditions based on stagnation and repeated tool errors
+
+
+You mention repeated failure in Week 6, but it’s worth specifying:
+
+
+- If test output signature unchanged for N iterations → AGENT_STUCK.
+
+- If patch apply fails K times → TOOL_ERROR with subreason PATCH_REJECTED.
+
+- If agent proposes empty/no-op diff repeatedly → AGENT_GAVE_UP or AGENT_NO_PROGRESS.
+
+Logging / schemas improvements (analysis friendliness)
+
+11) Version and normalize the event schema
+
+
+Events JSONL will evolve quickly; make it resilient:
+
+
+- Add event_version, event_id, parent_event_id (for causal chain), task_attempt_id.
+
+- Standardize timestamps (ISO8601 + monotonic duration).
+
+- Ensure every tool call event includes: inputs hash, outputs hash, and truncation indicators for stdout/stderr.
+
+12) Log truncation policy explicitly + store raw optionally
+
+
+You already mention truncation; formalize it:
+
+
+- [DONE] Store stdout_truncated: bool, stderr_truncated: bool, plus kept_head_lines, kept_tail_lines.
+
+- [DONE] Optionally store full logs behind a flag (--full-logs) so default runs don’t explode in size.
+
+13) Add cost / usage accounting
+
+
+For OpenRouter (or any provider):
+
+
+- Record prompt tokens, completion tokens, total cost (if available), retry count, and latency.
+
+- This enables “pass@cost” and “pass@time” comparisons later.
+
+Repo / caching improvements (performance and reliability)
+
+14) Concurrency-safe git mirror cache
+
+
+With --workers, you’ll hit races.
+
+
+- Use file locks around mirror fetch/update.
+
+- Validate mirror integrity (git fsck occasionally or on failure).
+
+- Consider --reference clones from mirror to speed up checkouts.
+
+15) Support private repos and auth cleanly
+
+
+Even if not needed now, design for it:
+
+
+- Allow repo.auth modes (ssh-agent forwarding disabled by default; token via host env but never mounted into container).
+
+- Redact repo URLs if they embed tokens.
+
+Task definition improvements (benchmark quality)
+
+16) [DONE] Add “expected failure mode” hints (optional)
+
+
+To prevent tasks that “fail for any reason” (e.g., missing dependency) from being accepted:
+
+
+- Optional fields like:
+	- validation.expected_exit_codes: [1]
+
+	- validation.expected_failure_regex: "AssertionError|FAILED"
+
+	- or expected_failing_tests: [ ...nodeids... ]
+
+This helps keep the benchmark meaningful.
+
+
+17) [DONE] Add a “known flaky” label and exclusion rules
+
+- labels: ["flaky", "slow", "network-sensitive"]
+
+- The runner can skip or quarantine flaky tasks by default, but still track them.
+
+Reporting / stats improvements (interpretability)
+
+18) Broaden reporting beyond pass rate
+
+
+Add per-run summaries:
+
+
+- Pass rate + Wilson CI
+
+- Time-to-pass distribution
+
+- Steps-to-pass distribution
+
+- Failure taxonomy breakdown by suite/task
+
+- “Most common failure signatures” (clustered by normalized pytest output)
+
+19) Paired stats: define default and edge handling
+
+
+For McNemar:
+
+
+- Specify how you handle tasks missing in one run (skip vs treat as fail).
+
+- Add an exact McNemar option for small samples (common early on).
+
+Developer experience improvements
+
+20) “Doctor” should test the full pipeline
+
+
+Your doctor.sh is good—make it also:
+
+
+- [DONE] Pull/build the runner image
+
+- [DONE] Run a tiny “hello world” task end-to-end
+
+- [DONE] Verify network isolation actually works (e.g., curl should fail in agent phase)
+
+1) Add explicit “Goals / Non-goals / Success metrics”
+
+Right now the design is solid, but the objective function is implicit (pass rate? time-to-pass? cost? reproducibility?). Add:
+
+Primary metric: e.g., pass@1 per task, plus suite-level pass rate
+
+Secondary metrics: median wall time, #tool calls, token usage, $ cost
+
+Non-goals: e.g., “not a full agent framework,” “not online browsing,” “not multi-repo changes,” etc.
+
+2) Resolve the “tasks” naming collision in your repo layout
+
+You have agentbench/tasks/ (code) and tasks/ (data). That’s going to confuse contributors and imports.
+
+Rename the data dir to benchmarks/ or taskpacks/
+
+Keep agentbench/tasks/ strictly as “task loading/validation modules”
+
+3) [DONE] Tighten baseline validation semantics
+
+“Baseline should fail” is good, but it’s easy to get false “fails” due to setup/env issues.
+Add optional fields like:
+
+validation.expected_exit_codes (e.g., [1])
+
+validation.expected_stderr_regex / expected_stdout_regex
+
+validation.disallowed_failure_regex (e.g., “ImportError”, “No module named”, etc.)
+This makes “BASELINE_NOT_FAILING” vs “SETUP_FAILED” far more reliable.
+
+4) Make the sandbox security posture explicit (beyond --network=none)
+
+You already have network controls; expand the hardening checklist so it’s not left implicit:
+
+--cap-drop=ALL, --security-opt=no-new-privileges
+
+--pids-limit, --read-only root FS (workspace mounted RW)
+
+explicit ulimits (open files, processes), and temp dirs
+
+document how secrets are prevented from entering the container (and what gets redacted in logs)
+
+5) Define a stable event envelope (so events are actually “event-sourced”)
+
+You list event types, but you’ll want a consistent envelope so you can reconstruct causality:
+
+event_id, ts, run_id, task_id, seq
+
+span_id / parent_span_id (or at least parent_event_id)
+
+actor (harness | agent | tool | sandbox)
+This turns events.jsonl into something you can query, visualize, and debug at scale.
+
+6) Clarify workspace lifecycle + caching rules under concurrency
+
+With --workers 4, you need to define:
+
+one workspace per (run_id, task_id) (no shared dirs)
+
+whether setup artifacts (like venv/site-packages) are reused or always reinstalled
+
+pip cache volume concurrency expectations (safe, but document it)
+
+how you clean up partial runs / keep_workspace behavior on failures
+
+7) Strengthen tool contract: add “observability” fields + size limits
+
+Current tool set is minimal (good). I’d add contract details that prevent runaway logs:
+
+For every tool result: duration_ms, truncated: bool, stdout_n_lines, stderr_n_lines
+
+For read_file: return total_lines, returned_line_range
+
+Global caps: max bytes per stdout/stderr per step; max patch size; max file read size
+This makes reports and debugging consistent and protects disk.
+
+8) Add “task constraints” that prevent invalid agent behavior
+
+You already have editable_globs. Consider:
+
+readonly_globs (explicitly protected paths)
+
+max_changed_files, max_lines_changed
+
+forbidden_commands patterns for run (e.g., curl, ssh, package managers during agent phase)
+These reduce “agent got lucky by doing something out of bounds.”
+
+9) Reporting: bake in paired-run identity + task matching rules
+
+You mention paired comparisons; specify the invariants:
+
+A paired report must match the same task_id set, same task commit, same docker image digest, same budgets/timeouts
+
+Define how to handle missing tasks / invalid tasks / flaky tasks in paired stats
+
+Add a standard CSV output schema (so you can ingest in notebooks easily)
+
+10) Determinism protocol: include test flake handling as first-class metadata
+
+You already call out flakiness. Make it explicit in records:
+
+is_flaky: bool, flake_check_runs: int, flake_failure_modes: [...]
+
+store the two baseline runs’ exit codes + a short hash of stdout/stderr
+This will save you from arguing with your own benchmark later.
+
+11) Add one “end-to-end golden taskpack” for CI
+
+Beyond unit tests, add 1–2 tiny deterministic tasks that run in <60s:
+
+ensures Docker, loader, baseline validation, tools, events, scoring, report all work
+
+run in GitHub Actions on every PR
+This prevents slow drift and keeps the harness trustworthy.
