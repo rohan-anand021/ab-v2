@@ -1,0 +1,34 @@
+instances:
+- id: psf__requests-2317
+  repo_url: https://github.com/psf/requests
+  commit: 091991be0da19de9108dbe5e3752917fea3d7fdc
+  environment_setup_commit: 091991be0da19de9108dbe5e3752917fea3d7fdc
+  version: '2.4'
+  test_command: PYTHONWARNINGS=ignore::UserWarning python -m pytest -q test_requests.py::RequestsTestCase::test_HTTP_302_ALLOW_REDIRECT_GET
+    test_requests.py::RequestsTestCase::test_POSTBIN_GET_POST_FILES test_requests.py::RequestsTestCase::test_POSTBIN_GET_POST_FILES_WITH_DATA
+    test_requests.py::RequestsTestCase::test_basicauth_with_netrc test_requests.py::RequestsTestCase::test_json_param_post_content_type_works
+    test_requests.py::RequestsTestCase::test_manual_redirect_with_partial_body_read
+    test_requests.py::RequestsTestCase::test_requests_history_is_saved test_requests.py::TestTimeout::test_encoded_methods
+  setup_commands:
+  - python -m pip install -U pip setuptools wheel
+  - pip install pytest
+  - pip install -e .
+  FAIL_TO_PASS:
+  - test_requests.py::RequestsTestCase::test_HTTP_302_ALLOW_REDIRECT_GET
+  - test_requests.py::RequestsTestCase::test_POSTBIN_GET_POST_FILES
+  - test_requests.py::RequestsTestCase::test_POSTBIN_GET_POST_FILES_WITH_DATA
+  - test_requests.py::RequestsTestCase::test_basicauth_with_netrc
+  - test_requests.py::RequestsTestCase::test_json_param_post_content_type_works
+  - test_requests.py::RequestsTestCase::test_manual_redirect_with_partial_body_read
+  - test_requests.py::RequestsTestCase::test_requests_history_is_saved
+  - test_requests.py::TestTimeout::test_encoded_methods
+  PASS_TO_PASS:
+  - test_requests.py::RequestsTestCase::test_BASICAUTH_TUPLE_HTTP_200_OK_GET
+  test_patch: "diff --git a/test_requests.py b/test_requests.py\nindex 467c5bc6..b2e12d06\
+    \ 100755\n--- a/test_requests.py\n+++ b/test_requests.py\n@@ -1389,6 +1389,11\
+    \ @@ class TestTimeout:\n         except ConnectTimeout:\n             pass\n\
+    \ \n+    def test_encoded_methods(self):\n+        \"\"\"See: https://github.com/kennethreitz/requests/issues/2316\"\
+    \"\"\n+        r = requests.request(b'GET', httpbin('get'))\n+        assert r.ok\n\
+    +\n \n SendCall = collections.namedtuple('SendCall', ('args', 'kwargs'))\n"
+  expected_fail: true
+  notes: SWE-bench-lite psf__requests-2317 baseline smoke

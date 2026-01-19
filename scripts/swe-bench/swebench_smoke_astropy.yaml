@@ -1,0 +1,28 @@
+{
+  "instances": [
+    {
+      "id": "astropy__astropy-12907",
+      "repo_url": "https://github.com/astropy/astropy",
+      "commit": "d16bfe05a744909de4b27f5875fe0d4ed41ce607",
+      "environment_setup_commit": "298ccb478e6bf092953bca67a3d29dc6c35f6752",
+      "version": "4.3",
+      "test_command": "PYTHONWARNINGS=ignore::UserWarning python -m pytest -q astropy/modeling/tests/test_separable.py",
+      "setup_commands": [
+        "python -m pip install -U pip 'setuptools<69' wheel",
+        "pip install 'setuptools_scm>=6.2' 'oldest-supported-numpy' 'numpy<2' 'cython==0.29.22' extension-helpers",
+        "pip install pytest",
+        "PIP_NO_BUILD_ISOLATION=1 pip install -e ."
+      ],
+      "FAIL_TO_PASS": [
+        "astropy/modeling/tests/test_separable.py::test_separable[compound_model6-result6]",
+        "astropy/modeling/tests/test_separable.py::test_separable[compound_model9-result9]"
+      ],
+      "PASS_TO_PASS": [
+        "astropy/modeling/tests/test_separable.py::test_coord_matrix",
+        "astropy/modeling/tests/test_separable.py::test_cdot",
+        "astropy/modeling/tests/test_separable.py::test_cstack"
+      ],
+      "notes": "SWE-bench-lite astropy__astropy-12907 baseline smoke"
+    }
+  ]
+}

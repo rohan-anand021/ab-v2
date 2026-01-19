@@ -1,0 +1,12 @@
+.venv
+.hf_cache/
+symlinks/
+uv.lock
+scan_log.txt
+spec.txt
+PROJECT_OVERVIEW.md
+artifacts/
+__pycache__/
+*.pyc
+.DS_Store
+.python-version

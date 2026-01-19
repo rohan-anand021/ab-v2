@@ -1,10 +1,11 @@
-# Minimal SWE-bench-lite smoke instances. This file uses JSON syntax for easy parsing but is valid YAML.
 {
   "instances": [
     {
       "id": "pallets__flask-4045",
       "repo_url": "https://github.com/pallets/flask",
       "commit": "d8c37f43724cd9fb0870f77877b7c4c7e38a19e0",
+      "environment_setup_commit": "d8c37f43724cd9fb0870f77877b7c4c7e38a19e0",
+      "version": "2.0.1",
       "test_command": "PYTHONWARNINGS=ignore::UserWarning python -m pytest -q -k \"test_dotted_name_not_allowed or test_route_decorator_custom_endpoint_with_dots\" tests/test_blueprints.py",
       "setup_commands": [
         "python -m pip install -U pip 'setuptools<81' wheel",
@@ -12,7 +13,7 @@
         "pip install \"pytest==6.2.4\"",
         "pip install -e ."
       ],
-      "notes": "SWE-bench-lite pallets__flask-4045 (base_commit=d8c37f43724cd9fb0870f77877b7c4c7e38a19e0, FAIL_TO_PASS two blueprint tests). Baseline tests should fail."
+      "notes": "SWE-bench-lite pallets__flask-4045 baseline smoke"
     }
   ]
 }
